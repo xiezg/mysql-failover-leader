@@ -1,4 +1,4 @@
- /*
+/*
 Copyright 2018 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,6 +23,7 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
 	"github.com/google/uuid"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
@@ -34,6 +35,7 @@ import (
 )
 
 func buildConfig(kubeconfig string) (*rest.Config, error) {
+
 	if kubeconfig != "" {
 		cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 		if err != nil {
@@ -50,15 +52,16 @@ func buildConfig(kubeconfig string) (*rest.Config, error) {
 }
 
 func main() {
+
 	klog.InitFlags(nil)
 
 	var kubeconfig string
 	var leaseLockName string
 	var leaseLockNamespace string
 	var id string
-    var targetPID int
+	var targetPID int
 
-    flag.IntVar( &targetPID, "pid", os.Getppid(), "send single SIGUSR1 to pid")
+	flag.IntVar(&targetPID, "pid", os.Getppid(), "send single SIGUSR1 to pid")
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
 	flag.StringVar(&id, "id", uuid.New().String(), "the holder identity name")
 	flag.StringVar(&leaseLockName, "lease-lock-name", "", "the lease lock resource name")
@@ -68,10 +71,12 @@ func main() {
 	if leaseLockName == "" {
 		klog.Fatal("unable to get lease lock resource name (missing lease-lock-name flag).")
 	}
+
 	if leaseLockNamespace == "" {
 		klog.Fatal("unable to get lease lock resource namespace (missing lease-lock-namespace flag).")
 	}
 
+	klog.Infof("id:%v", id)
 	// leader election uses the Kubernetes API by writing to a
 	// lock object, which can be a LeaseLock object (preferred),
 	// a ConfigMap, or an Endpoints (deprecated) object.
@@ -83,25 +88,6 @@ func main() {
 	}
 	client := clientset.NewForConfigOrDie(config)
 
-	run := func(ctx context.Context) {
-		// complete your controller loop here
-		klog.Info("Controller loop...")
-
-        ps, err := os.FindProcess( targetPID )
-        if err != nil{
-            klog.Errorf( "FindProcess:[%d] fails. err:%v", targetPID, err )
-		    select {}
-        }
-
-        if err := ps.Signal( syscall.SIGUSR2 ); err != nil{
-            klog.Errorf( "Signal [%d] fails. err:%v", targetPID, err )
-		    select {}
-        }
-
-		select {}
-	}
-
-	// use a Go context so we can tell the leaderelection code when we
 	// want to step down
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -126,10 +112,49 @@ func main() {
 		},
 		Client: client.CoordinationV1(),
 		LockConfig: resourcelock.ResourceLockConfig{
-			Identity: id,
+			Identity: id, // Identity is the unique string identifying a lease holder across all participants in an election.
 		},
 	}
 
+	run := func(ctx context.Context) {
+		// complete your controller loop here
+		klog.Info("Controller loop...")
+
+		ps, err := os.FindProcess(targetPID)
+		if err != nil {
+			klog.Errorf("FindProcess:[%d] fails. err:%v", targetPID, err)
+			time.Sleep(1 * time.Second) //此处不等待直接cancel,会导致line:209 le.renew(ctx) 失败，无法释放lease资源
+			cancel()
+			return
+		}
+
+		//// Run starts the leader election loop
+		//197 func (le *LeaderElector) Run(ctx context.Context) {
+		//198     defer runtime.HandleCrash()
+		//199     defer func() {
+		//200         le.config.Callbacks.OnStoppedLeading()
+		//201     }()
+		//202
+		//203     if !le.acquire(ctx) {
+		//204         return // ctx signalled done
+		//205     }
+		//206     ctx, cancel := context.WithCancel(ctx)
+		//207     defer cancel()
+		//208     go le.config.Callbacks.OnStartedLeading(ctx)
+		//209     le.renew(ctx)
+		//210 }
+
+		if err := ps.Signal(syscall.SIGUSR2); err != nil {
+			klog.Errorf("Signal [%d] fails. err:%v", targetPID, err)
+			time.Sleep(1 * time.Second) //此处不等待直接cancel,会导致line:209 le.renew(ctx) 失败，无法释放lease资源
+			cancel()
+			return
+		}
+
+		klog.Info("send notify SIGUSR2")
+	}
+
+	// use a Go context so we can tell the leaderelection code when we
 	// start the leader election code loop
 	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
 		Lock: lock,
@@ -140,19 +165,21 @@ func main() {
 		// get elected before your background loop finished, violating
 		// the stated goal of the lease.
 		ReleaseOnCancel: true,
-		LeaseDuration:   60 * time.Second,
+		LeaseDuration:   20 * time.Second,
 		RenewDeadline:   15 * time.Second,
 		RetryPeriod:     5 * time.Second,
 		Callbacks: leaderelection.LeaderCallbacks{
+			//由goroutine来执行 go le.config.Callbacks.OnStartedLeading(ctx)
 			OnStartedLeading: func(ctx context.Context) {
 				// we're notified when we start - this is where you would
 				// usually put your code
+				klog.Infof("myself get leader elected: %v", id)
 				run(ctx)
 			},
 			OnStoppedLeading: func() {
 				// we can do cleanup here
 				klog.Infof("leader lost: %s", id)
-				os.Exit(0)
+				os.Exit(1) //The program terminates immediately; deferred functions are not run.
 			},
 			OnNewLeader: func(identity string) {
 				// we're notified when new leader elected
@@ -160,9 +187,8 @@ func main() {
 					// I just got the lock
 					return
 				}
-				klog.Infof("new leader elected: %s", identity)
+				klog.Infof("OnNewLeader new leader elected: %s", identity)
 			},
 		},
 	})
 }
-
